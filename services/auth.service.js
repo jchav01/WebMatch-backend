@@ -1,21 +1,71 @@
+// auth.service.js mis à jour
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { PrismaClient } = require('@prisma/client');
 const logger = require('../config/logger');
 const AppError = require('../utils/AppError');
+const crypto = require('crypto');
 
 const prisma = new PrismaClient();
+
+// Générateur d'username unique
+const generateUniqueUsername = async () => {
+  const maxAttempts = 10;
+  
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Format: user_XXXXXX (6 caractères aléatoires)
+    const randomString = crypto.randomBytes(3).toString('hex');
+    const username = `user_${randomString}`;
+    
+    // Vérifier l'unicité
+    const existingUser = await prisma.user.findUnique({
+      where: { username }
+    });
+    
+    if (!existingUser) {
+      return username;
+    }
+  }
+  
+  // Si on arrive ici, utiliser timestamp + random pour garantir l'unicité
+  const timestamp = Date.now().toString(36);
+  const randomString = crypto.randomBytes(2).toString('hex');
+  return `user_${timestamp}_${randomString}`;
+};
+
+// Fonction pour générer un nickname initial
+const generateInitialNickname = (firstName, lastName) => {
+  // Option 1: Prénom + initiale du nom
+  const initial = lastName ? lastName.charAt(0).toUpperCase() : '';
+  return `${firstName}${initial}`.trim();
+  
+  // Option 2: Juste le prénom
+  // return firstName;
+};
 
 const signup = async (userData) => {
   const { email, password, firstName, lastName, dateOfBirth, gender } = userData;
 
   logger.info('auth.service - Tentative signup', { email });
 
+  // Validations
   if (!email || !password || !firstName || !lastName || !gender || !dateOfBirth) {
     logger.warn('auth.service - Données requises manquantes', { email });
     throw new AppError('Données requises manquantes.', 400);
   }
 
+  // Validation email
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    throw new AppError('Format email invalide', 400);
+  }
+
+  // Validation mot de passe
+  if (password.length < 8) {
+    throw new AppError('Le mot de passe doit contenir au moins 8 caractères', 400);
+  }
+
+  // Validation date de naissance
   if (isNaN(Date.parse(dateOfBirth))) {
     logger.warn('auth.service - Date de naissance invalide', { email });
     throw new AppError('Date de naissance invalide.', 400);
@@ -34,8 +84,11 @@ const signup = async (userData) => {
     throw new AppError('Cet email est déjà utilisé', 400);
   }
 
-  // Générer le username automatiquement (par défaut → prénom + suffixe random pour éviter les doublons)
-  const generatedUsername = firstName;
+  // Générer username unique
+  const generatedUsername = await generateUniqueUsername();
+  
+  // Générer nickname initial (peut être modifié par l'utilisateur plus tard)
+  const initialNickname = generateInitialNickname(firstName, lastName);
 
   const hashedPassword = await bcrypt.hash(password, 12);
 
@@ -63,6 +116,7 @@ const signup = async (userData) => {
       dateOfBirth: new Date(dateOfBirth),
       gender,
       username: generatedUsername,
+      nickname: initialNickname,
       preferences: defaultPreferences,
     },
     select: {
@@ -71,6 +125,7 @@ const signup = async (userData) => {
       firstName: true,
       lastName: true,
       username: true,
+      nickname: true,
       dateOfBirth: true,
       gender: true,
       photoUrl: true,
@@ -84,7 +139,11 @@ const signup = async (userData) => {
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
 
-  logger.info('auth.service - Signup réussi', { userId: user.id });
+  logger.info('auth.service - Signup réussi', { 
+    userId: user.id, 
+    username: user.username,
+    nickname: user.nickname 
+  });
 
   return { user, token };
 };
@@ -100,13 +159,20 @@ const login = async (email, password) => {
       password: true,
       firstName: true,
       lastName: true,
-      username: true
+      username: true,
+      nickname: true,
+      isActive: true
     }
   });
 
   if (!user) {
     logger.warn('auth.service - Email non trouvé', { email });
     throw new AppError('Identifiants invalides', 401);
+  }
+
+  if (!user.isActive) {
+    logger.warn('auth.service - Compte désactivé', { userId: user.id });
+    throw new AppError('Compte désactivé', 403);
   }
 
   const passwordMatch = await bcrypt.compare(password, user.password);
@@ -124,6 +190,12 @@ const login = async (email, password) => {
 
   const { password: _, ...userWithoutPassword } = user;
 
+  // Mettre à jour lastSeen
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { lastSeen: new Date() }
+  });
+
   logger.info('auth.service - Login réussi', { userId: user.id });
 
   return { user: userWithoutPassword, token };
@@ -137,22 +209,6 @@ const calculateAgeFromDate = (birthDate) => {
     age--;
   }
   return age;
-};
-
-// Générer un username unique
-const generateUniqueUsername = async (firstName) => {
-  let baseUsername = firstName.toLowerCase().replace(/\s+/g, '');
-  let username = baseUsername;
-  let counter = 0;
-
-  while (true) {
-    const existingUser = await prisma.user.findUnique({ where: { username } });
-    if (!existingUser) {
-      return username;
-    }
-    counter++;
-    username = `${baseUsername}${counter}`;
-  }
 };
 
 module.exports = { signup, login };

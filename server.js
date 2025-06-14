@@ -8,6 +8,7 @@ const logger = require('./config/logger');
 require('dotenv').config();
 const http = require('http');
 const { Server } = require('socket.io');
+const jwt = require('jsonwebtoken');
 
 const { corsOptions, uploadsCorsOptions } = require('./middlewares/corsConfig');
 
@@ -16,9 +17,11 @@ const userRoutes = require('./routes/user.routes');
 const photosRoutes = require('./routes/photos.routes');
 const preferencesRoutes = require('./routes/preferences.routes');
 const exploreRoutes = require('./routes/exploreRoutes');
+const friendsRoutes = require('./routes/friends.routes');
+const messagesRoutes = require('./routes/messages.routes');
 
 const app = express();
-const prisma = new PrismaClient();
+const { prisma, setIo } = require('./config/shared');
 let roomCounter = 0;
 
 
@@ -29,8 +32,10 @@ if (!fs.existsSync(uploadDir)) {
 
 app.use('/uploads', cors(uploadsCorsOptions), express.static(uploadDir));
 app.use(helmet());
-app.use(cors(corsOptions));
-app.use(express.json());
+app.use(cors({
+  origin: '*',
+  credentials: true
+}));app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use('/api/user/preferences', preferencesRoutes);
@@ -38,6 +43,8 @@ app.use('/api/explore', exploreRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/user', photosRoutes);
+app.use('/api/friends', friendsRoutes);
+app.use('/api/messages', messagesRoutes);
 
 // Logger dev
 if (process.env.NODE_ENV === 'development') {
@@ -95,61 +102,131 @@ const io = new Server(server, {
   },
 });
 
+setIo(io);
+
 // État global pour la gestion des rooms et utilisateurs
 const waitingUsers = new Set(); // Utilisateurs en attente
 const activeRooms = new Map();  // Room ID -> { users: [socket1, socket2], info: {} }
 const userRooms = new Map();    // Socket ID -> Room ID
+const authenticatedUsers = new Map();
 
 // Utilitaires
 const generateRoomId = () => `room_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-const cleanupUser = (socket) => {
-  // Retirer de la liste d'attente
+// Modifier la fonction cleanupUser pour gérer VideoSession au lieu de VideoCall :
+const cleanupUser = async (socket) => {
   waitingUsers.delete(socket.id);
   
-  // Nettoyer les rooms
   const roomId = userRooms.get(socket.id);
   if (roomId && activeRooms.has(roomId)) {
     const room = activeRooms.get(roomId);
     
-    // Notifier l'autre utilisateur
     const otherUser = room.users.find(user => user.id !== socket.id);
     if (otherUser) {
       otherUser.emit('peer-disconnected', { peerId: socket.id });
     }
     
-    // Supprimer la room
+    // Enregistrer la fin de la session vidéo si authentifié
+    if (socket.userId) {
+      try {
+        const videoSession = await prisma.videoSession.findUnique({
+          where: { roomId }
+        });
+        
+        if (videoSession && !videoSession.endedAt) {
+          const duration = videoSession.startedAt 
+            ? Math.floor((new Date() - videoSession.startedAt) / 1000)
+            : 0;
+            
+          await prisma.videoSession.update({
+            where: { id: videoSession.id },
+            data: {
+              endedAt: new Date(),
+              duration,
+              endReason: 'user_disconnect'
+            }
+          });
+        }
+      } catch (error) {
+        console.error('Error updating video session:', error);
+      }
+    }
+    
     activeRooms.delete(roomId);
     userRooms.delete(socket.id);
     
-    // Nettoyer l'autre utilisateur aussi
     if (otherUser) {
       userRooms.delete(otherUser.id);
     }
   }
+  
+  // Mettre à jour le statut hors ligne si authentifié
+  if (socket.userId) {
+    authenticatedUsers.delete(socket.id);
+    
+    try {
+      await prisma.user.update({
+        where: { id: socket.userId },
+        data: {
+          isOnline: false,
+          lastSeen: new Date()
+        }
+      });
+      
+      // Notifier les amis du statut hors ligne
+      const user = await prisma.user.findUnique({
+        where: { id: socket.userId },
+        include: {
+          friends: true,
+          friendsOf: true
+        }
+      });
+      
+      if (user) {
+        const allFriends = [...user.friends, ...user.friendsOf];
+        const uniqueFriendIds = [...new Set(allFriends.map(f => f.id))];
+        
+        uniqueFriendIds.forEach(friendId => {
+          io.to(`user_${friendId}`).emit('friendOffline', socket.userId);
+        });
+      }
+    } catch (error) {
+      console.error('Error updating offline status:', error);
+    }
+  }
 };
 
-const createRoom = (user1, user2) => {
+const createRoom = async (user1, user2) => {
   const roomId = generateRoomId();
-  
-  // Déterminer qui est l'initiateur (aléatoirement)
   const isUser1Initiator = Math.random() < 0.5;
   
-  // Créer la room
   activeRooms.set(roomId, {
     users: [user1, user2],
     created: Date.now(),
   });
   
-  // Associer les utilisateurs à la room
   userRooms.set(user1.id, roomId);
   userRooms.set(user2.id, roomId);
   
-  // Faire rejoindre les rooms Socket.IO
   user1.join(roomId);
   user2.join(roomId);
   
-  // Notifier les utilisateurs
+  // Créer un enregistrement VideoSession si les utilisateurs sont authentifiés
+  if (user1.userId || user2.userId) {
+    try {
+      await prisma.videoSession.create({
+        data: {
+          roomId,
+          user1Id: user1.userId || null,
+          user2Id: user2.userId || null,
+          sessionType: 'RANDOM'
+        }
+      });
+    } catch (error) {
+      console.error('Error creating video session:', error);
+    }
+  }
+  
   user1.emit('match-found', { 
     roomId, 
     isInitiator: isUser1Initiator 
@@ -163,9 +240,71 @@ const createRoom = (user1, user2) => {
   return roomId;
 };
 
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth.token;
+    if (token) {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const user = await prisma.user.findUnique({
+        where: { id: decoded.id },
+        select: { 
+          id: true, 
+          username: true,
+          nickname: true,
+          firstName: true,
+          lastName: true,
+          photoUrl: true 
+        }
+      });
+      
+      if (user) {
+        socket.userId = user.id;
+        socket.userInfo = user;
+        authenticatedUsers.set(socket.id, user.id);
+        
+        // Mettre à jour le statut en ligne
+        await prisma.user.update({
+          where: { id: user.id },
+          data: { 
+            isOnline: true,
+            lastSeen: new Date()
+          }
+        });
+      }
+    }
+    next();
+  } catch (err) {
+    console.log('Socket auth error:', err.message);
+    next(); // On laisse passer même sans auth pour le chat anonyme
+  }
+});
+
 // Gestionnaires Socket.IO
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  console.log(`User connected: ${socket.id} (${socket.userId || 'anonymous'})`);
+  
+  // Si authentifié, rejoindre la room personnelle et notifier les amis
+  if (socket.userId) {
+    socket.join(`user_${socket.userId}`);
+    
+    // Notifier les amis du statut en ligne
+    prisma.user.findUnique({
+      where: { id: socket.userId },
+      include: {
+        friends: true,
+        friendsOf: true
+      }
+    }).then(user => {
+      if (user) {
+        const allFriends = [...user.friends, ...user.friendsOf];
+        const uniqueFriendIds = [...new Set(allFriends.map(f => f.id))];
+        
+        uniqueFriendIds.forEach(friendId => {
+          io.to(`user_${friendId}`).emit('friendOnline', socket.userId);
+        });
+      }
+    }).catch(console.error);
+  }
 
   // Chercher un partenaire
   socket.on('find-partner', () => {
@@ -268,9 +407,30 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Chat - Message
-  socket.on('chat-message', ({ roomId, message, sender, timestamp }) => {
+  // Modifier l'événement chat-message pour sauvegarder dans VideoSessionMessage :
+  socket.on('chat-message', async ({ roomId, message, sender, timestamp }) => {
     console.log(`Message in room ${roomId}: ${message}`);
+    
+    // Enregistrer le message dans l'historique de la session vidéo
+    if (socket.userId) {
+      try {
+        const videoSession = await prisma.videoSession.findUnique({
+          where: { roomId }
+        });
+        
+        if (videoSession) {
+          await prisma.videoSessionMessage.create({
+            data: {
+              videoSessionId: videoSession.id,
+              senderId: socket.userId,
+              content: message
+            }
+          });
+        }
+      } catch (error) {
+        console.error('Error saving video chat message:', error);
+      }
+    }
     
     socket.to(roomId).emit('chat-message', {
       message,
@@ -292,7 +452,106 @@ io.on('connection', (socket) => {
     console.log(`User disconnected: ${socket.id}`);
     cleanupUser(socket);
   });
+
+    // Typage pour messagerie privée
+  socket.on('private-typing', ({ to, isTyping }) => {
+    if (socket.userId) {
+      io.to(`user_${to}`).emit('userTyping', {
+        userId: socket.userId,
+        isTyping
+      });
+    }
+  });
+
+  // Message privé via Socket (optionnel, les messages passent plutôt par l'API REST)
+  socket.on('private-message', async ({ receiverId, content, messageType = 'TEXT' }) => {
+    if (!socket.userId) {
+      socket.emit('error', { message: 'Authentication required' });
+      return;
+    }
+    
+    try {
+      // Vérifier si les utilisateurs sont amis ou ont un match
+      const [friendship, match] = await Promise.all([
+        prisma.user.findFirst({
+          where: {
+            id: socket.userId,
+            OR: [
+              { friends: { some: { id: receiverId } } },
+              { friendsOf: { some: { id: receiverId } } }
+            ]
+          }
+        }),
+        prisma.match.findFirst({
+          where: {
+            OR: [
+              { user1Id: socket.userId, user2Id: receiverId, isActive: true },
+              { user1Id: receiverId, user2Id: socket.userId, isActive: true }
+            ]
+          }
+        })
+      ]);
+      
+      if (!friendship && !match) {
+        socket.emit('error', { message: 'You must be friends or have a match to send messages' });
+        return;
+      }
+      
+      // Utiliser la logique de l'API messages pour créer le message
+      // ... (voir routes/messages.routes.js)
+      
+    } catch (error) {
+      console.error('Error sending private message:', error);
+      socket.emit('error', { message: 'Failed to send message' });
+    }
+  });
+
+  // Marquer les messages comme lus
+  socket.on('mark-messages-read', async ({ conversationId }) => {
+    if (!socket.userId) return;
+    
+    try {
+      const conversation = await prisma.conversation.findUnique({
+        where: { id: conversationId }
+      });
+      
+      if (!conversation) return;
+      
+      const updateField = conversation.user1Id === socket.userId ? 'unreadCount1' : 'unreadCount2';
+      const partnerId = conversation.user1Id === socket.userId ? conversation.user2Id : conversation.user1Id;
+      
+      await prisma.$transaction([
+        prisma.message.updateMany({
+          where: {
+            conversationId,
+            receiverId: socket.userId,
+            isRead: false
+          },
+          data: {
+            isRead: true,
+            readAt: new Date()
+          }
+        }),
+        prisma.conversation.update({
+          where: { id: conversationId },
+          data: {
+            [updateField]: 0
+          }
+        })
+      ]);
+      
+      // Notifier l'expéditeur
+      io.to(`user_${partnerId}`).emit('messagesRead', {
+        readBy: socket.userId,
+        conversationId,
+        timestamp: new Date()
+      });
+    } catch (error) {
+      console.error('Error marking messages as read:', error);
+    }
+  });
 });
+
 
 // Routes API (optionnel)
 app.get('/health', (req, res) => {
@@ -307,18 +566,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-app.get('/stats', (req, res) => {
-  res.json({
-    connectedUsers: io.engine.clientsCount,
-    waitingUsers: waitingUsers.size,
-    activeRooms: activeRooms.size,
-    rooms: Array.from(activeRooms.entries()).map(([id, room]) => ({
-      id,
-      userCount: room.users.length,
-      created: room.created
-    }))
-  });
-});
 
 // Nettoyage périodique des rooms abandonnées
 setInterval(() => {
@@ -348,9 +595,77 @@ server.listen(PORT, () => {
   console.log(`📱 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
-// Clean shutdown
+
+
+// Modifier la route /stats pour inclure les nouvelles métriques :
+app.get('/stats', async (req, res) => {
+  try {
+    const [
+      totalUsers, 
+      onlineUsers, 
+      totalMessages, 
+      activeVideoSessions,
+      totalFriendships,
+      pendingFriendRequests
+    ] = await Promise.all([
+      prisma.user.count(),
+      prisma.user.count({ where: { isOnline: true } }),
+      prisma.message.count({ where: { isDeleted: false } }),
+      prisma.videoSession.count({ where: { endedAt: null } }),
+      prisma.user.findMany({
+        select: {
+          _count: {
+            select: { friends: true }
+          }
+        }
+      }).then(users => users.reduce((sum, user) => sum + user._count.friends, 0) / 2),
+      prisma.friendRequest.count({ where: { status: 'PENDING' } })
+    ]);
+    
+    res.json({
+      connectedSockets: io.engine.clientsCount,
+      waitingUsers: waitingUsers.size,
+      activeRooms: activeRooms.size,
+      authenticatedUsers: authenticatedUsers.size,
+      database: {
+        totalUsers,
+        onlineUsers,
+        totalMessages,
+        activeVideoSessions,
+        totalFriendships,
+        pendingFriendRequests
+      },
+      rooms: Array.from(activeRooms.entries()).map(([id, room]) => ({
+        id,
+        userCount: room.users.length,
+        created: room.created
+      }))
+    });
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+});
+
+// Dans le clean shutdown, mettre tous les utilisateurs hors ligne :
 process.on('SIGTERM', async () => {
   console.log('SIGTERM reçu, fermeture du serveur...');
+  
+  // Mettre tous les utilisateurs hors ligne
+  await prisma.user.updateMany({
+    where: { isOnline: true },
+    data: { isOnline: false, lastSeen: new Date() }
+  });
+  
+  // Terminer toutes les sessions vidéo actives
+  await prisma.videoSession.updateMany({
+    where: { endedAt: null },
+    data: { 
+      endedAt: new Date(),
+      endReason: 'server_shutdown'
+    }
+  });
+  
   await prisma.$disconnect();
   server.close(() => {
     console.log('Serveur fermé');
@@ -359,8 +674,27 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
   console.log('SIGINT reçu, fermeture du serveur...');
+  
+  // Mettre tous les utilisateurs hors ligne
+  await prisma.user.updateMany({
+    where: { isOnline: true },
+    data: { isOnline: false, lastSeen: new Date() }
+  });
+  
+  // Terminer toutes les sessions vidéo actives
+  await prisma.videoSession.updateMany({
+    where: { endedAt: null },
+    data: { 
+      endedAt: new Date(),
+      endReason: 'server_shutdown'
+    }
+  });
+  
   await prisma.$disconnect();
   server.close(() => {
     console.log('Serveur fermé');
   });
 });
+
+module.exports.prisma = prisma;
+module.exports.io = io;

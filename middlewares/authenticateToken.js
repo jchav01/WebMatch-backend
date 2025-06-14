@@ -4,54 +4,45 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
 const authenticateToken = async (req, res, next) => {
-  try {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
 
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: 'Token manquant'
-      });
+  if (!token) {
+    logger?.warn('Token manquant');
+    return res.status(401).json({ success: false, message: 'Token manquant' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (!decoded?.userId) {
+      logger?.warn('Token invalide : userId manquant');
+      return res.status(401).json({ success: false, message: 'Token invalide (userId absent)' });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (typeof decoded.userId !== 'number') {
+      logger?.error('userId du token invalide : doit être un nombre', { decoded });
+      return res.status(401).json({ success: false, message: 'userId invalide' });
+    }
 
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
-      select: {
-        id: true,
-        email: true
-      }
+      select: { id: true, email: true }
     });
 
     if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Utilisateur non trouvé'
-      });
+      logger?.warn(`Utilisateur introuvable pour userId : ${decoded.userId}`);
+      return res.status(401).json({ success: false, message: 'Utilisateur non trouvé' });
     }
 
     req.user = user;
     next();
-  } catch (error) {
-    if (error.name === 'JsonWebTokenError') {
-      return res.status(403).json({
-        success: false,
-        message: 'Token invalide'
-      });
-    }
-    if (error.name === 'TokenExpiredError') {
-      return res.status(403).json({
-        success: false,
-        message: 'Token expiré'
-      });
-    }
-
-    return res.status(500).json({
-      success: false,
-      message: 'Erreur d\'authentification'
+  } catch (err) {
+    logger?.error('Erreur de vérification du token', {
+      message: err.message,
+      stack: err.stack
     });
+    return res.status(403).json({ success: false, message: 'Token invalide' });
   }
 };
 

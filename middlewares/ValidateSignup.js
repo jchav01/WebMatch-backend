@@ -21,11 +21,8 @@ const validateSignup = (req, res, next) => {
     throw new AppError('Le nom est requis.', 400);
   }
 
-  if (!username || username.trim() === '') {
-    throw new AppError('Le nom d\'utilisateur est requis.', 400);
-  }
 
-  if (!gender || (gender !== 'Homme' && gender !== 'Femme' && gender !== 'Autre')) {
+  if (!gender || (gender !== 'MALE' && gender !== 'FEMALE' && gender !== 'OTHER')) {
     throw new AppError('Le genre est invalide.', 400);
   }
 

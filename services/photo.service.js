@@ -3,6 +3,7 @@ const sharp = require('sharp');
 const path = require('path');
 const fs = require('fs');
 const logger = require('../config/logger');
+require('dotenv').config();
 
 const prisma = new PrismaClient();
 
@@ -34,7 +35,7 @@ const addUserPhoto = async (userId, fileBuffer) => {
     .jpeg({ quality: 80 })
     .toFile(filepath);
 
-  const photoUrl = `/uploads/${filename}`;
+  const photoUrl = `${process.env.BASE_URL}/uploads/${filename}`;
 
   const photo = await prisma.userPhoto.create({
     data: {
