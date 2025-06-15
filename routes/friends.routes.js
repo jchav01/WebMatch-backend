@@ -153,18 +153,41 @@ router.get('/requests', authenticateToken, async (req, res) => {
 
 // Envoyer une demande d'ami
 router.post('/send-request', authenticateToken, async (req, res) => {
+  console.log('Request body:', req.body);
+  console.log('User ID:', req.user.id);
   try {
-    const { receiverId, message } = req.body;
+    const { receiverId, receiverUsername, message } = req.body;
     const senderId = req.user.id;
     
-    if (!receiverId) {
+    // Accepter soit l'ID soit le username
+    let receiverIdInt;
+    
+    if (receiverId) {
+      // Si on a un ID, l'utiliser
+      receiverIdInt = parseInt(receiverId);
+    } else if (receiverUsername) {
+      // Si on a un username, chercher l'utilisateur
+      const receiver = await prisma.user.findUnique({
+        where: { username: receiverUsername },
+        select: { id: true }
+      });
+      
+      if (!receiver) {
+        return res.status(404).json({
+          success: false,
+          message: 'Utilisateur non trouvé'
+        });
+      }
+      
+      receiverIdInt = receiver.id;
+    } else {
       return res.status(400).json({
         success: false,
-        message: 'ID du destinataire requis'
+        message: 'ID ou username du destinataire requis'
       });
     }
     
-    if (senderId === receiverId) {
+    if (senderId === receiverIdInt) {
       return res.status(400).json({
         success: false,
         message: 'Vous ne pouvez pas vous ajouter vous-même'
@@ -175,8 +198,8 @@ router.post('/send-request', authenticateToken, async (req, res) => {
     const block = await prisma.block.findFirst({
       where: {
         OR: [
-          { blockerId: senderId, blockedId: receiverId },
-          { blockerId: receiverId, blockedId: senderId }
+          { blockerId: senderId, blockedId: receiverIdInt },
+          { blockerId: receiverIdInt, blockedId: senderId }
         ]
       }
     });
@@ -193,8 +216,8 @@ router.post('/send-request', authenticateToken, async (req, res) => {
       where: {
         id: senderId,
         OR: [
-          { friends: { some: { id: receiverId } } },
-          { friendsOf: { some: { id: receiverId } } }
+          { friends: { some: { id: receiverIdInt } } },
+          { friendsOf: { some: { id: receiverIdInt } } }
         ]
       }
     });
@@ -210,19 +233,17 @@ router.post('/send-request', authenticateToken, async (req, res) => {
     const existingRequest = await prisma.friendRequest.findFirst({
       where: {
         OR: [
-          { senderId, receiverId, status: 'PENDING' },
-          { senderId: receiverId, receiverId: senderId, status: 'PENDING' }
+          { senderId, receiverId: receiverIdInt, status: 'PENDING' },
+          { senderId: receiverIdInt, receiverId: senderId, status: 'PENDING' }
         ]
       }
     });
     
     if (existingRequest) {
       // Si c'est une demande inverse, l'accepter automatiquement
-      if (existingRequest.senderId === receiverId) {
-        return router.handle(req, res, () => {
-          req.params.requestId = existingRequest.id;
-          return acceptFriendRequest(req, res);
-        });
+      if (existingRequest.senderId === receiverIdInt) {
+        req.params.requestId = existingRequest.id;
+        return acceptFriendRequest(req, res);
       }
       
       return res.status(400).json({
@@ -231,30 +252,32 @@ router.post('/send-request', authenticateToken, async (req, res) => {
       });
     }
     
-    // Créer la demande et la notification
-    const [newRequest] = await prisma.$transaction([
-      prisma.friendRequest.create({
-        data: {
-          senderId,
-          receiverId,
-          message
-        },
-        include: {
-          sender: {
-            select: {
-              id: true,
-              username: true,
-              nickname: true,
-              firstName: true,
-              lastName: true,
-              photoUrl: true
-            }
+    // Créer la demande d'ami
+    const newRequest = await prisma.friendRequest.create({
+      data: {
+        senderId,
+        receiverId: receiverIdInt,
+        message: message || null
+      },
+      include: {
+        sender: {
+          select: {
+            id: true,
+            username: true,
+            nickname: true,
+            firstName: true,
+            lastName: true,
+            photoUrl: true
           }
         }
-      }),
-      prisma.notification.create({
+      }
+    });
+    
+    // Créer la notification
+    try {
+      await prisma.notification.create({
         data: {
-          userId: receiverId,
+          userId: receiverIdInt,
           type: 'FRIEND_REQUEST',
           title: 'Nouvelle demande d\'ami',
           message: `${newRequest.sender.nickname || newRequest.sender.firstName} vous a envoyé une demande d'ami`,
@@ -263,17 +286,21 @@ router.post('/send-request', authenticateToken, async (req, res) => {
             senderId: senderId
           }
         }
-      })
-    ]);
+      });
+    } catch (notifError) {
+      console.error('Error creating notification:', notifError);
+    }
     
     // Notifier via Socket.IO
-    getIo().to(`user_${receiverId}`).emit('friendRequestReceived', {
-      request: newRequest,
-      notification: {
-        type: 'friend_request',
-        message: `${newRequest.sender.nickname || newRequest.sender.firstName} vous a envoyé une demande d'ami`
-      }
-    });
+    if (getIo()) {
+      getIo().to(`user_${receiverIdInt}`).emit('friendRequestReceived', {
+        request: newRequest,
+        notification: {
+          type: 'friend_request',
+          message: `${newRequest.sender.nickname || newRequest.sender.firstName} vous a envoyé une demande d'ami`
+        }
+      });
+    }
     
     res.json({
       success: true,
@@ -284,15 +311,16 @@ router.post('/send-request', authenticateToken, async (req, res) => {
     console.error('Error sending friend request:', error);
     res.status(500).json({
       success: false,
-      message: 'Erreur lors de l\'envoi de la demande'
+      message: 'Erreur lors de l\'envoi de la demande',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// Accepter une demande d'ami
+// Fonction acceptFriendRequest
 const acceptFriendRequest = async (req, res) => {
   try {
-    const { requestId } = req.params;
+    const requestId = parseInt(req.params.requestId);
     const userId = req.user.id;
     
     const request = await prisma.friendRequest.findUnique({
@@ -343,46 +371,56 @@ const acceptFriendRequest = async (req, res) => {
     }
     
     // Transaction pour accepter la demande et créer l'amitié
-    const [updatedRequest] = await prisma.$transaction([
+    const updatedRequest = await prisma.$transaction(async (tx) => {
       // Mettre à jour le statut de la demande
-      prisma.friendRequest.update({
+      const updated = await tx.friendRequest.update({
         where: { id: requestId },
         data: {
           status: 'ACCEPTED',
           respondedAt: new Date()
         }
-      }),
+      });
+      
       // Créer la relation d'amitié
-      prisma.user.update({
+      await tx.user.update({
         where: { id: request.senderId },
         data: {
           friends: {
             connect: { id: request.receiverId }
           }
         }
-      }),
+      });
+      
       // Créer une notification pour l'expéditeur
-      prisma.notification.create({
-        data: {
-          userId: request.senderId,
-          type: 'FRIEND_REQUEST',
-          title: 'Demande acceptée',
-          message: `${request.receiver.nickname || request.receiver.firstName} a accepté votre demande d'ami`,
+      try {
+        await tx.notification.create({
           data: {
-            friendId: request.receiverId
+            userId: request.senderId,
+            type: 'FRIEND_REQUEST',
+            title: 'Demande acceptée',
+            message: `${request.receiver.nickname || request.receiver.firstName} a accepté votre demande d'ami`,
+            data: {
+              friendId: request.receiverId
+            }
           }
-        }
-      })
-    ]);
-    
-    // Notifier l'expéditeur
-    getIo().to(`user_${request.senderId}`).emit('friendRequestAccepted', {
-      friend: request.receiver,
-      notification: {
-        type: 'friend_request_accepted',
-        message: `${request.receiver.nickname || request.receiver.firstName} a accepté votre demande d'ami`
+        });
+      } catch (notifError) {
+        console.error('Error creating notification:', notifError);
       }
+      
+      return updated;
     });
+    
+    // Notifier l'expéditeur via Socket.IO
+    if (getIo()) {
+      getIo().to(`user_${request.senderId}`).emit('friendRequestAccepted', {
+        friend: request.receiver,
+        notification: {
+          type: 'friend_request_accepted',
+          message: `${request.receiver.nickname || request.receiver.firstName} a accepté votre demande d'ami`
+        }
+      });
+    }
     
     res.json({
       success: true,
@@ -393,7 +431,8 @@ const acceptFriendRequest = async (req, res) => {
     console.error('Error accepting friend request:', error);
     res.status(500).json({
       success: false,
-      message: 'Erreur lors de l\'acceptation de la demande'
+      message: 'Erreur lors de l\'acceptation de la demande',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 };
@@ -403,7 +442,7 @@ router.post('/accept-request/:requestId', authenticateToken, acceptFriendRequest
 // Rejeter une demande d'ami
 router.post('/reject-request/:requestId', authenticateToken, async (req, res) => {
   try {
-    const { requestId } = req.params;
+    const requestId = parseInt(req.params.requestId);
     const userId = req.user.id;
     
     const request = await prisma.friendRequest.findUnique({
@@ -449,7 +488,7 @@ router.post('/reject-request/:requestId', authenticateToken, async (req, res) =>
 // Supprimer un ami
 router.delete('/remove/:friendId', authenticateToken, async (req, res) => {
   try {
-    const { friendId } = req.params;
+    const friendId = parseInt(req.params.friendId);
     const userId = req.user.id;
     
     await prisma.$transaction(async (tx) => {
@@ -458,10 +497,10 @@ router.delete('/remove/:friendId', authenticateToken, async (req, res) => {
         where: { id: userId },
         data: {
           friends: {
-            disconnect: { id: parseInt(friendId) }
+            disconnect: { id: friendId }
           },
           friendsOf: {
-            disconnect: { id: parseInt(friendId) }
+            disconnect: { id: friendId }
           }
         }
       });
@@ -483,15 +522,15 @@ router.delete('/remove/:friendId', authenticateToken, async (req, res) => {
 // Vérifier si deux utilisateurs sont amis
 router.get('/check/:userId', authenticateToken, async (req, res) => {
   try {
-    const { userId: targetUserId } = req.params;
+    const targetUserId = parseInt(req.params.userId);
     const currentUserId = req.user.id;
     
     const friendship = await prisma.user.findFirst({
       where: {
         id: currentUserId,
         OR: [
-          { friends: { some: { id: parseInt(targetUserId) } } },
-          { friendsOf: { some: { id: parseInt(targetUserId) } } }
+          { friends: { some: { id: targetUserId } } },
+          { friendsOf: { some: { id: targetUserId } } }
         ]
       }
     });
@@ -514,7 +553,7 @@ router.get('/check/:userId', authenticateToken, async (req, res) => {
 // Bloquer un utilisateur
 router.post('/block/:userId', authenticateToken, async (req, res) => {
   try {
-    const { userId: blockedId } = req.params;
+    const blockedId = parseInt(req.params.userId);
     const { reason } = req.body;
     const blockerId = req.user.id;
     
@@ -524,7 +563,7 @@ router.post('/block/:userId', authenticateToken, async (req, res) => {
       prisma.block.create({
         data: {
           blockerId,
-          blockedId: parseInt(blockedId),
+          blockedId,
           reason
         }
       }),
@@ -533,10 +572,10 @@ router.post('/block/:userId', authenticateToken, async (req, res) => {
         where: { id: blockerId },
         data: {
           friends: {
-            disconnect: { id: parseInt(blockedId) }
+            disconnect: { id: blockedId }
           },
           friendsOf: {
-            disconnect: { id: parseInt(blockedId) }
+            disconnect: { id: blockedId }
           }
         }
       })

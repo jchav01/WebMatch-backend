@@ -109,17 +109,23 @@ const waitingUsers = new Set(); // Utilisateurs en attente
 const activeRooms = new Map();  // Room ID -> { users: [socket1, socket2], info: {} }
 const userRooms = new Map();    // Socket ID -> Room ID
 const authenticatedUsers = new Map();
+const revealRequests = new Map(); // roomId -> { user1: boolean, user2: boolean }
+const roomTimers = new Map(); // roomId -> startTime
 
 // Utilitaires
 const generateRoomId = () => `room_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-// Modifier la fonction cleanupUser pour gérer VideoSession au lieu de VideoCall :
+// Modifier cleanupUser pour nettoyer les nouvelles structures
 const cleanupUser = async (socket) => {
   waitingUsers.delete(socket.id);
   
   const roomId = userRooms.get(socket.id);
   if (roomId && activeRooms.has(roomId)) {
     const room = activeRooms.get(roomId);
+    
+    // Nettoyer les structures de révélation
+    revealRequests.delete(roomId);
+    roomTimers.delete(roomId);
     
     const otherUser = room.users.find(user => user.id !== socket.id);
     if (otherUser) {
@@ -197,6 +203,16 @@ const cleanupUser = async (socket) => {
 };
 
 const createRoom = async (user1, user2) => {
+  console.log(`[Server] Creating room for users:`, {
+    user1: { id: user1.id, userId: user1.userId },
+    user2: { id: user2.id, userId: user2.userId }
+  });
+
+  if (!user1.userId || !user2.userId) {
+    console.error('[Server][createRoom] Both users must be authenticated');
+    return null;
+  }
+  
   const roomId = generateRoomId();
   const isUser1Initiator = Math.random() < 0.5;
   
@@ -207,24 +223,32 @@ const createRoom = async (user1, user2) => {
   
   userRooms.set(user1.id, roomId);
   userRooms.set(user2.id, roomId);
+
+  // Initialiser le timer de la room
+  roomTimers.set(roomId, Date.now());
+  
+  // Initialiser les demandes de révélation
+  revealRequests.set(roomId, {
+    [user1.id]: false,
+    [user2.id]: false
+  });
   
   user1.join(roomId);
   user2.join(roomId);
   
   // Créer un enregistrement VideoSession si les utilisateurs sont authentifiés
-  if (user1.userId || user2.userId) {
-    try {
-      await prisma.videoSession.create({
-        data: {
-          roomId,
-          user1Id: user1.userId || null,
-          user2Id: user2.userId || null,
-          sessionType: 'RANDOM'
-        }
-      });
-    } catch (error) {
-      console.error('Error creating video session:', error);
-    }
+  try {
+    await prisma.videoSession.create({
+      data: {
+        roomId,
+        user1Id: user1.userId,
+        user2Id: user2.userId,
+        sessionType: 'RANDOM'
+      }
+    });
+    console.log(`[Server] VideoSession created for room ${roomId}`);
+  } catch (error) {
+    console.error('[Server] Error creating video session:', error);
   }
   
   user1.emit('match-found', { 
@@ -236,46 +260,64 @@ const createRoom = async (user1, user2) => {
     isInitiator: !isUser1Initiator 
   });
   
-  console.log(`Room created: ${roomId} with users ${user1.id} and ${user2.id}`);
+  console.log(`[Server] Room created: ${roomId} with users ${user1.id} and ${user2.id}`);
+  console.log(`[Server] Active rooms:`, Array.from(activeRooms.keys()));
+  
   return roomId;
 };
+
+
+// Dans server.js - Middleware d'authentification Socket.IO corrigé
 
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token;
-    if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      const user = await prisma.user.findUnique({
-        where: { id: decoded.id },
-        select: { 
-          id: true, 
-          username: true,
-          nickname: true,
-          firstName: true,
-          lastName: true,
-          photoUrl: true 
-        }
-      });
-      
-      if (user) {
-        socket.userId = user.id;
-        socket.userInfo = user;
-        authenticatedUsers.set(socket.id, user.id);
-        
-        // Mettre à jour le statut en ligne
-        await prisma.user.update({
-          where: { id: user.id },
-          data: { 
-            isOnline: true,
-            lastSeen: new Date()
-          }
-        });
-      }
+    if (!token) {
+      return next(new Error('Authentication required'));
     }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Le token utilise 'userId' et non 'id'
+    const userId = decoded.userId;
+    
+    if (!userId) {
+      return next(new Error('Invalid token: no user ID'));
+    }
+    
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { 
+        id: true, 
+        username: true,
+        nickname: true,
+        firstName: true,
+        lastName: true,
+        photoUrl: true 
+      }
+    });
+    
+    if (!user) {
+      return next(new Error('User not found'));
+    }
+    
+    socket.userId = user.id;
+    socket.userInfo = user;
+    authenticatedUsers.set(socket.id, user.id);
+    
+    // Mettre à jour le statut en ligne
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { 
+        isOnline: true,
+        lastSeen: new Date()
+      }
+    });
+    
     next();
   } catch (err) {
     console.log('Socket auth error:', err.message);
-    next(); // On laisse passer même sans auth pour le chat anonyme
+    next(new Error('Invalid authentication'));
   }
 });
 
@@ -306,52 +348,76 @@ io.on('connection', (socket) => {
     }).catch(console.error);
   }
 
-  // Chercher un partenaire
   socket.on('find-partner', () => {
-    console.log(`User ${socket.id} looking for partner`);
+    console.log(`[Server] User ${socket.id} (userId: ${socket.userId}) looking for partner`);
+    
+    // Vérifier l'authentification
+    if (!socket.userId) {
+      console.error(`[Server] User ${socket.id} not authenticated`);
+      socket.emit('error', { message: 'Authentication required' });
+      return;
+    }
     
     // Nettoyer d'abord l'utilisateur actuel
     cleanupUser(socket);
     
     // Vérifier s'il y a quelqu'un en attente
     if (waitingUsers.size > 0) {
+      console.log(`[Server] Found ${waitingUsers.size} users waiting`);
+      
       // Prendre le premier utilisateur en attente
       const waitingUserId = waitingUsers.values().next().value;
       const waitingUser = io.sockets.sockets.get(waitingUserId);
       
-      if (waitingUser && waitingUser.connected) {
+      if (waitingUser && waitingUser.connected && waitingUser.userId) {
+        console.log(`[Server] Matching ${socket.id} with ${waitingUserId}`);
+        
         // Retirer de la liste d'attente
         waitingUsers.delete(waitingUserId);
         
         // Créer une room
         createRoom(waitingUser, socket);
       } else {
-        // L'utilisateur en attente n'est plus connecté
+        console.log(`[Server] Waiting user ${waitingUserId} no longer valid`);
+        // L'utilisateur en attente n'est plus connecté ou pas authentifié
         waitingUsers.delete(waitingUserId);
         waitingUsers.add(socket.id);
+        console.log(`[Server] User ${socket.id} added to waiting list`);
       }
     } else {
       // Ajouter à la liste d'attente
       waitingUsers.add(socket.id);
-      console.log(`User ${socket.id} added to waiting list`);
+      console.log(`[Server] User ${socket.id} added to waiting list (first in queue)`);
     }
   });
 
   // Rejoindre une room
   socket.on('join-room', (roomId) => {
-    console.log(`User ${socket.id} joining room ${roomId}`);
+    console.log(`[Server] User ${socket.id} joining room ${roomId}`);
     
     const room = activeRooms.get(roomId);
+    if (!room) {
+      console.log(`[Server] Room ${roomId} not found!`);
+      socket.emit('error', { message: 'Room not found' });
+      return;
+    }
+    
     if (room && room.users.some(user => user.id === socket.id)) {
       socket.join(roomId);
+      console.log(`[Server] User ${socket.id} successfully joined room ${roomId}`);
       
       // Vérifier si les deux utilisateurs sont dans la room
       const roomSockets = io.sockets.adapter.rooms.get(roomId);
+      console.log(`[Server] Room ${roomId} has ${roomSockets?.size || 0} users`);
+      
       if (roomSockets && roomSockets.size === 2) {
         // Notifier que la room est prête
         io.to(roomId).emit('ready');
-        console.log(`Room ${roomId} is ready`);
+        console.log(`[Server] Room ${roomId} is ready - emitted ready event`);
       }
+    } else {
+      console.log(`[Server] User ${socket.id} not authorized for room ${roomId}`);
+      socket.emit('error', { message: 'Not authorized for this room' });
     }
   });
 
@@ -368,16 +434,156 @@ io.on('connection', (socket) => {
     cleanupUser(socket);
   });
 
+  
   // Partager les informations utilisateur
   socket.on('user-info', ({ roomId, userProfile }) => {
-    console.log(`User ${socket.id} sharing profile in room ${roomId}`);
+    console.log(`[Server] User ${socket.id} sharing profile in room ${roomId}:`, {
+      roomId,
+      userProfile,
+      userId: socket.userId,
+      username: socket.userInfo?.username
+    });
+    
+    // Vérifier que la room existe
+    const room = activeRooms.get(roomId);
+    if (!room) {
+      console.log(`[Server] Room ${roomId} not found!`);
+      socket.emit('error', { message: 'Room not found' });
+      return;
+    }
+    
+    // Trouver l'autre utilisateur dans la room
+    const otherUser = room.users.find(user => user.id !== socket.id);
+    if (!otherUser) {
+      console.log(`[Server] No other user found in room ${roomId}`);
+      return;
+    }
+    
+    console.log(`[Server] Transmitting user-info from ${socket.id} to ${otherUser.id}`);
+    
+    // IMPORTANT: Enrichir avec les vraies données depuis le socket authentifié
+    const enrichedUserProfile = {
+      ...userProfile,
+      id: socket.userId, // Garder l'ID pour compatibilité
+      username: socket.userInfo?.username, // Ajouter le username
+      userId: socket.userId
+    };
+    
+    console.log(`[Server] Enriched profile with real data:`, enrichedUserProfile);
     
     // Transmettre à l'autre utilisateur de la room
     socket.to(roomId).emit('user-info', {
-      userProfile,
+      userProfile: enrichedUserProfile,
       sender: socket.id
     });
   });
+
+  // Vérifier le temps écoulé dans la room
+  socket.on('check-room-time', ({ roomId }) => {
+    const startTime = roomTimers.get(roomId);
+    if (startTime) {
+      const elapsedMinutes = (Date.now() - startTime) / 1000 / 60;
+      socket.emit('room-time-update', { 
+        roomId, 
+        elapsedMinutes,
+        canReveal: elapsedMinutes >= 0
+      });
+    }
+  });
+
+  // === ÉVÉNEMENTS POUR LES DEMANDES D'AMIS EN SESSION VIDÉO ===
+
+// Notifier le partenaire qu'une demande d'ami a été envoyée
+socket.on('friend-request-sent', async ({ roomId, toUserId }) => {
+  console.log(`[FriendRequest] User ${socket.userId} sent friend request to ${toUserId} in room ${roomId}`);
+  
+  try {
+    // Vérifier que l'utilisateur est authentifié
+    if (!socket.userId) {
+      socket.emit('error', { message: 'Authentication required' });
+      return;
+    }
+
+    // Vérifier que la session vidéo existe
+    const videoSession = await prisma.videoSession.findUnique({
+      where: { roomId },
+      include: {
+        user1: true,
+        user2: true
+      }
+    });
+
+    if (!videoSession) {
+      console.error(`[FriendRequest] No video session found for room ${roomId}`);
+      return;
+    }
+
+    // Vérifier que les deux utilisateurs sont dans la session
+    const isUser1 = videoSession.user1Id === socket.userId;
+    const partnerId = isUser1 ? videoSession.user2Id : videoSession.user1Id;
+
+    if (partnerId !== toUserId) {
+      console.error(`[FriendRequest] Partner ID mismatch`);
+      return;
+    }
+
+    // Notifier le partenaire via sa room personnelle
+    io.to(`user_${toUserId}`).emit('friend-request-sent', {
+      fromUserId: socket.userId,
+      roomId
+    });
+
+    console.log(`[FriendRequest] Notified user ${toUserId} about friend request`);
+  } catch (error) {
+    console.error('[FriendRequest] Error handling friend request sent:', error);
+  }
+});
+
+// Notifier que la demande d'ami a été acceptée
+socket.on('friend-request-accepted', async ({ roomId, toUserId }) => {
+  console.log(`[FriendRequest] User ${socket.userId} accepted friend request from ${toUserId} in room ${roomId}`);
+  
+  try {
+    if (!socket.userId) {
+      socket.emit('error', { message: 'Authentication required' });
+      return;
+    }
+
+    // Notifier le partenaire
+    io.to(`user_${toUserId}`).emit('friend-request-accepted', {
+      fromUserId: socket.userId,
+      roomId
+    });
+
+    console.log(`[FriendRequest] Notified user ${toUserId} about acceptance`);
+  } catch (error) {
+    console.error('[FriendRequest] Error handling friend request accepted:', error);
+  }
+});
+
+// Notifier que la demande d'ami a été rejetée
+socket.on('friend-request-rejected', async ({ roomId, toUserId }) => {
+  console.log(`[FriendRequest] User ${socket.userId} rejected friend request from ${toUserId} in room ${roomId}`);
+  
+  try {
+    if (!socket.userId) {
+      socket.emit('error', { message: 'Authentication required' });
+      return;
+    }
+
+    // Notifier le partenaire
+    io.to(`user_${toUserId}`).emit('friend-request-rejected', {
+      fromUserId: socket.userId,
+      roomId
+    });
+
+    console.log(`[FriendRequest] Notified user ${toUserId} about rejection`);
+  } catch (error) {
+    console.error('[FriendRequest] Error handling friend request rejected:', error);
+  }
+});
+
+// === FIN DES ÉVÉNEMENTS POUR LES DEMANDES D'AMIS ===
 
   // Signaling WebRTC - Offer
   socket.on('offer', ({ roomId, offer }) => {
@@ -472,8 +678,7 @@ io.on('connection', (socket) => {
     
     try {
       // Vérifier si les utilisateurs sont amis ou ont un match
-      const [friendship, match] = await Promise.all([
-        prisma.user.findFirst({
+        const friendship = await prisma.user.findFirst({
           where: {
             id: socket.userId,
             OR: [
@@ -481,18 +686,9 @@ io.on('connection', (socket) => {
               { friendsOf: { some: { id: receiverId } } }
             ]
           }
-        }),
-        prisma.match.findFirst({
-          where: {
-            OR: [
-              { user1Id: socket.userId, user2Id: receiverId, isActive: true },
-              { user1Id: receiverId, user2Id: socket.userId, isActive: true }
-            ]
-          }
-        })
-      ]);
+        });
       
-      if (!friendship && !match) {
+      if (!friendship) {
         socket.emit('error', { message: 'You must be friends or have a match to send messages' });
         return;
       }

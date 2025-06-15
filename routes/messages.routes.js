@@ -4,43 +4,37 @@ const router = express.Router();
 const authenticateToken = require('../middlewares/authenticateToken');
 const { prisma, getIo } = require('../config/shared');
 
-
-// Obtenir ou créer une conversation
-const getOrCreateConversation = async (user1Id, user2Id) => {
-  // Toujours ordonner les IDs de la même façon
-  const [smallerId, largerId] = user1Id < user2Id ? [user1Id, user2Id] : [user2Id, user1Id];
-  
-  let conversation = await prisma.conversation.findUnique({
-    where: {
-      user1Id_user2Id: {
-        user1Id: smallerId,
-        user2Id: largerId
-      }
-    }
-  });
-  
-  if (!conversation) {
-    conversation = await prisma.conversation.create({
-      data: {
-        user1Id: smallerId,
-        user2Id: largerId
-      }
-    });
-  }
-  
-  return conversation;
-};
-
-// Obtenir toutes les conversations
+// Obtenir les conversations
 router.get('/conversations', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     
+    // Récupérer d'abord la liste des amis
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        friends: { select: { id: true } },
+        friendsOf: { select: { id: true } }
+      }
+    });
+    
+    const friendIds = [
+      ...user.friends.map(f => f.id),
+      ...user.friendsOf.map(f => f.id)
+    ];
+    
+    // Récupérer uniquement les conversations avec des amis
     const conversations = await prisma.conversation.findMany({
       where: {
         OR: [
-          { user1Id: userId },
-          { user2Id: userId }
+          { 
+            user1Id: userId,
+            user2Id: { in: friendIds }
+          },
+          { 
+            user2Id: userId,
+            user1Id: { in: friendIds }
+          }
         ]
       },
       include: {
@@ -69,12 +63,15 @@ router.get('/conversations', authenticateToken, async (req, res) => {
           }
         },
         messages: {
-          orderBy: {
-            createdAt: 'desc'
-          },
           take: 1,
-          where: {
-            isDeleted: false
+          orderBy: { createdAt: 'desc' },
+          select: {
+            id: true,
+            content: true,
+            messageType: true,
+            createdAt: true,
+            senderId: true,
+            isRead: true
           }
         }
       },
@@ -83,20 +80,21 @@ router.get('/conversations', authenticateToken, async (req, res) => {
       }
     });
     
-    // Formatter les conversations
+    // Formater les conversations
     const formattedConversations = conversations.map(conv => {
-      const partner = conv.user1Id === userId ? conv.user2 : conv.user1;
+      const otherUser = conv.user1Id === userId ? conv.user2 : conv.user1;
       const unreadCount = conv.user1Id === userId ? conv.unreadCount1 : conv.unreadCount2;
       
       return {
         id: conv.id,
-        partner: {
-          ...partner,
-          displayName: partner.nickname || `${partner.firstName} ${partner.lastName}`
+        otherUser: {
+          ...otherUser,
+          displayName: otherUser.nickname || `${otherUser.firstName} ${otherUser.lastName}`
         },
         lastMessage: conv.messages[0] || null,
+        unreadCount,
         lastMessageAt: conv.lastMessageAt,
-        unreadCount
+        createdAt: conv.createdAt
       };
     });
     
@@ -114,46 +112,57 @@ router.get('/conversations', authenticateToken, async (req, res) => {
 });
 
 // Obtenir les messages d'une conversation
-router.get('/conversation/:partnerId', authenticateToken, async (req, res) => {
+router.get('/conversation/:conversationId', authenticateToken, async (req, res) => {
   try {
-    const { partnerId } = req.params;
+    const conversationId = parseInt(req.params.conversationId);
     const userId = req.user.id;
-    const { page = 1, limit = 50 } = req.query;
     
-    // Vérifier si les utilisateurs sont amis ou ont un match
-    const [friendship, match] = await Promise.all([
-      prisma.user.findFirst({
-        where: {
-          id: userId,
-          OR: [
-            { friends: { some: { id: parseInt(partnerId) } } },
-            { friendsOf: { some: { id: parseInt(partnerId) } } }
-          ]
-        }
-      }),
-      prisma.match.findFirst({
-        where: {
-          OR: [
-            { user1Id: userId, user2Id: parseInt(partnerId), isActive: true },
-            { user1Id: parseInt(partnerId), user2Id: userId, isActive: true }
-          ]
-        }
-      })
-    ]);
+    // Vérifier que l'utilisateur fait partie de la conversation
+    const conversation = await prisma.conversation.findUnique({
+      where: { id: conversationId },
+      include: {
+        user1: true,
+        user2: true
+      }
+    });
     
-    if (!friendship && !match) {
-      return res.status(403).json({
+    if (!conversation) {
+      return res.status(404).json({
         success: false,
-        message: 'Vous devez être amis ou avoir un match pour voir les messages'
+        message: 'Conversation non trouvée'
       });
     }
     
-    // Obtenir la conversation
-    const conversation = await getOrCreateConversation(userId, parseInt(partnerId));
+    if (conversation.user1Id !== userId && conversation.user2Id !== userId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Non autorisé'
+      });
+    }
     
+    // Vérifier que les utilisateurs sont toujours amis
+    const otherUserId = conversation.user1Id === userId ? conversation.user2Id : conversation.user1Id;
+    const friendship = await prisma.user.findFirst({
+      where: {
+        id: userId,
+        OR: [
+          { friends: { some: { id: otherUserId } } },
+          { friendsOf: { some: { id: otherUserId } } }
+        ]
+      }
+    });
+    
+    if (!friendship) {
+      return res.status(403).json({
+        success: false,
+        message: 'Vous devez être amis pour voir cette conversation'
+      });
+    }
+    
+    // Récupérer les messages
     const messages = await prisma.message.findMany({
       where: {
-        conversationId: conversation.id,
+        conversationId,
         isDeleted: false
       },
       include: {
@@ -182,10 +191,8 @@ router.get('/conversation/:partnerId', authenticateToken, async (req, res) => {
         }
       },
       orderBy: {
-        createdAt: 'desc'
-      },
-      take: parseInt(limit),
-      skip: (parseInt(page) - 1) * parseInt(limit)
+        createdAt: 'asc'
+      }
     });
     
     // Marquer les messages comme lus
@@ -194,7 +201,7 @@ router.get('/conversation/:partnerId', authenticateToken, async (req, res) => {
     await prisma.$transaction([
       prisma.message.updateMany({
         where: {
-          conversationId: conversation.id,
+          conversationId,
           receiverId: userId,
           isRead: false
         },
@@ -204,27 +211,31 @@ router.get('/conversation/:partnerId', authenticateToken, async (req, res) => {
         }
       }),
       prisma.conversation.update({
-        where: { id: conversation.id },
+        where: { id: conversationId },
         data: {
           [updateField]: 0
         }
       })
     ]);
     
-    // Notifier l'expéditeur que les messages ont été lus
-    getIo().to(`user_${partnerId}`).emit('messagesRead', {
-      readBy: userId,
-      conversationId: conversation.id,
-      timestamp: new Date()
-    });
+    // Notifier l'expéditeur via Socket
+    const io = getIo();
+    if (io) {
+      io.to(`user_${otherUserId}`).emit('messagesRead', {
+        conversationId,
+        readBy: userId,
+        timestamp: new Date()
+      });
+    }
     
     res.json({
       success: true,
-      data: messages.reverse(), // Remettre dans l'ordre chronologique
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        hasMore: messages.length === parseInt(limit)
+      data: {
+        conversation: {
+          ...conversation,
+          otherUser: conversation.user1Id === userId ? conversation.user2 : conversation.user1
+        },
+        messages
       }
     });
   } catch (error) {
@@ -239,7 +250,7 @@ router.get('/conversation/:partnerId', authenticateToken, async (req, res) => {
 // Envoyer un message
 router.post('/send', authenticateToken, async (req, res) => {
   try {
-    const { receiverId, content, messageType = 'TEXT', attachments, replyToId } = req.body;
+    const { receiverId, content, messageType = 'TEXT', replyToId } = req.body;
     const senderId = req.user.id;
     
     if (!receiverId || !content) {
@@ -249,12 +260,32 @@ router.post('/send', authenticateToken, async (req, res) => {
       });
     }
     
-    // Vérifier si l'utilisateur n'est pas bloqué
+    const receiverIdInt = parseInt(receiverId);
+    
+    // Vérifier que les utilisateurs sont amis
+    const friendship = await prisma.user.findFirst({
+      where: {
+        id: senderId,
+        OR: [
+          { friends: { some: { id: receiverIdInt } } },
+          { friendsOf: { some: { id: receiverIdInt } } }
+        ]
+      }
+    });
+    
+    if (!friendship) {
+      return res.status(403).json({
+        success: false,
+        message: 'Vous devez être amis pour envoyer des messages'
+      });
+    }
+    
+    // Vérifier les blocages
     const block = await prisma.block.findFirst({
       where: {
         OR: [
-          { blockerId: senderId, blockedId: parseInt(receiverId) },
-          { blockerId: parseInt(receiverId), blockedId: senderId }
+          { blockerId: senderId, blockedId: receiverIdInt },
+          { blockerId: receiverIdInt, blockedId: senderId }
         ]
       }
     });
@@ -266,118 +297,95 @@ router.post('/send', authenticateToken, async (req, res) => {
       });
     }
     
-    // Vérifier si les utilisateurs sont amis ou ont un match
-    const [friendship, match] = await Promise.all([
-      prisma.user.findFirst({
-        where: {
-          id: senderId,
-          OR: [
-            { friends: { some: { id: parseInt(receiverId) } } },
-            { friendsOf: { some: { id: parseInt(receiverId) } } }
-          ]
-        }
-      }),
-      prisma.match.findFirst({
-        where: {
-          OR: [
-            { user1Id: senderId, user2Id: parseInt(receiverId), isActive: true },
-            { user1Id: parseInt(receiverId), user2Id: senderId, isActive: true }
-          ]
-        }
-      })
-    ]);
+    // Trouver ou créer la conversation
+    let conversation = await prisma.conversation.findFirst({
+      where: {
+        OR: [
+          { user1Id: senderId, user2Id: receiverIdInt },
+          { user1Id: receiverIdInt, user2Id: senderId }
+        ]
+      }
+    });
     
-    if (!friendship && !match) {
-      return res.status(403).json({
-        success: false,
-        message: 'Vous devez être amis ou avoir un match pour envoyer des messages'
+    if (!conversation) {
+      conversation = await prisma.conversation.create({
+        data: {
+          user1Id: Math.min(senderId, receiverIdInt),
+          user2Id: Math.max(senderId, receiverIdInt)
+        }
       });
     }
     
-    // Obtenir ou créer la conversation
-    const conversation = await getOrCreateConversation(senderId, parseInt(receiverId));
-    
-    // Créer le message et mettre à jour la conversation
-    const [message] = await prisma.$transaction(async (tx) => {
-      // Créer le message
-      const newMessage = await tx.message.create({
-        data: {
-          conversationId: conversation.id,
-          senderId,
-          receiverId: parseInt(receiverId),
-          content,
-          messageType,
-          attachments,
-          replyToId: replyToId ? parseInt(replyToId) : null
-        },
-        include: {
-          sender: {
-            select: {
-              id: true,
-              username: true,
-              nickname: true,
-              firstName: true,
-              lastName: true,
-              photoUrl: true
-            }
-          },
-          replyTo: {
-            select: {
-              id: true,
-              content: true,
-              senderId: true
-            }
-          }
-        }
-      });
-      
-      // Mettre à jour la conversation
-      const unreadField = conversation.user1Id === parseInt(receiverId) 
-        ? 'unreadCount1' 
-        : 'unreadCount2';
-      
-      await tx.conversation.update({
-        where: { id: conversation.id },
-        data: {
-          lastMessageAt: new Date(),
-          lastMessage: content.substring(0, 100), // Limiter à 100 caractères
-          [unreadField]: { increment: 1 }
-        }
-      });
-      
-      // Créer une notification
-      await tx.notification.create({
-        data: {
-          userId: parseInt(receiverId),
-          type: 'MESSAGE',
-          title: 'Nouveau message',
-          message: `${newMessage.sender.nickname || newMessage.sender.firstName} vous a envoyé un message`,
-          data: {
-            senderId,
-            conversationId: conversation.id,
-            messageId: newMessage.id
-          }
-        }
-      });
-      
-      return newMessage;
-    });
-    
-    // Émettre le message via Socket.IO
-    getIo().to(`user_${receiverId}`).emit('newMessage', {
-      message: {
-        ...message,
-        sender: {
-          ...message.sender,
-          displayName: message.sender.nickname || `${message.sender.firstName} ${message.sender.lastName}`
-        }
+    // Créer le message
+    const message = await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        senderId,
+        receiverId: receiverIdInt,
+        content,
+        messageType,
+        replyToId: replyToId ? parseInt(replyToId) : null
       },
-      conversationId: conversation.id,
-      notification: {
-        type: 'new_message',
-        message: `Nouveau message de ${message.sender.nickname || message.sender.firstName}`
+      include: {
+        sender: {
+          select: {
+            id: true,
+            username: true,
+            nickname: true,
+            firstName: true,
+            lastName: true,
+            photoUrl: true
+          }
+        },
+        replyTo: {
+          select: {
+            id: true,
+            content: true,
+            senderId: true,
+            sender: {
+              select: {
+                nickname: true,
+                firstName: true
+              }
+            }
+          }
+        }
       }
     });
+    
+    // Mettre à jour la conversation
+    const unreadField = conversation.user1Id === receiverIdInt ? 'unreadCount1' : 'unreadCount2';
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: {
+        lastMessage: content,
+        lastMessageAt: new Date(),
+        [unreadField]: { increment: 1 }
+      }
+    });
+    
+    // Créer une notification
+    await prisma.notification.create({
+      data: {
+        userId: receiverIdInt,
+        type: 'MESSAGE',
+        title: 'Nouveau message',
+        message: `${message.sender.nickname || message.sender.firstName} vous a envoyé un message`,
+        data: {
+          conversationId: conversation.id,
+          senderId
+        }
+      }
+    });
+    
+    // Envoyer via Socket.IO
+    const io = getIo();
+    if (io) {
+      io.to(`user_${receiverIdInt}`).emit('newMessage', {
+        conversationId: conversation.id,
+        message
+      });
+    }
     
     res.json({
       success: true,
@@ -393,14 +401,14 @@ router.post('/send', authenticateToken, async (req, res) => {
 });
 
 // Modifier un message
-router.put('/:messageId', authenticateToken, async (req, res) => {
+router.put('/message/:messageId', authenticateToken, async (req, res) => {
   try {
-    const { messageId } = req.params;
+    const messageId = parseInt(req.params.messageId);
     const { content } = req.body;
     const userId = req.user.id;
     
     const message = await prisma.message.findUnique({
-      where: { id: parseInt(messageId) }
+      where: { id: messageId }
     });
     
     if (!message) {
@@ -418,20 +426,34 @@ router.put('/:messageId', authenticateToken, async (req, res) => {
     }
     
     const updatedMessage = await prisma.message.update({
-      where: { id: parseInt(messageId) },
+      where: { id: messageId },
       data: {
         content,
         isEdited: true,
         editedAt: new Date()
+      },
+      include: {
+        sender: {
+          select: {
+            id: true,
+            username: true,
+            nickname: true,
+            firstName: true,
+            lastName: true,
+            photoUrl: true
+          }
+        }
       }
     });
     
-    // Notifier le destinataire
-    getIo().to(`user_${message.receiverId}`).emit('messageEdited', {
-      messageId: message.id,
-      conversationId: message.conversationId,
-      newContent: content
-    });
+    // Notifier via Socket
+    const io = getIo();
+    if (io) {
+      io.to(`user_${message.receiverId}`).emit('messageEdited', {
+        conversationId: message.conversationId,
+        message: updatedMessage
+      });
+    }
     
     res.json({
       success: true,
@@ -447,13 +469,13 @@ router.put('/:messageId', authenticateToken, async (req, res) => {
 });
 
 // Supprimer un message (soft delete)
-router.delete('/:messageId', authenticateToken, async (req, res) => {
+router.delete('/message/:messageId', authenticateToken, async (req, res) => {
   try {
-    const { messageId } = req.params;
+    const messageId = parseInt(req.params.messageId);
     const userId = req.user.id;
     
     const message = await prisma.message.findUnique({
-      where: { id: parseInt(messageId) }
+      where: { id: messageId }
     });
     
     if (!message) {
@@ -470,61 +492,32 @@ router.delete('/:messageId', authenticateToken, async (req, res) => {
       });
     }
     
-    const deletedMessage = await prisma.message.update({
-      where: { id: parseInt(messageId) },
+    await prisma.message.update({
+      where: { id: messageId },
       data: {
         isDeleted: true,
         deletedAt: new Date()
       }
     });
     
-    // Notifier le destinataire
-    getIo().to(`user_${message.receiverId}`).emit('messageDeleted', {
-      messageId: message.id,
-      conversationId: message.conversationId
-    });
+    // Notifier via Socket
+    const io = getIo();
+    if (io) {
+      io.to(`user_${message.receiverId}`).emit('messageDeleted', {
+        conversationId: message.conversationId,
+        messageId
+      });
+    }
     
     res.json({
       success: true,
-      message: 'Message supprimé',
-      data: deletedMessage
+      message: 'Message supprimé'
     });
   } catch (error) {
     console.error('Error deleting message:', error);
     res.status(500).json({
       success: false,
       message: 'Erreur lors de la suppression du message'
-    });
-  }
-});
-
-// Obtenir le nombre de messages non lus
-router.get('/unread-count', authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    
-    const conversations = await prisma.conversation.findMany({
-      where: {
-        OR: [
-          { user1Id: userId, unreadCount1: { gt: 0 } },
-          { user2Id: userId, unreadCount2: { gt: 0 } }
-        ]
-      }
-    });
-    
-    const totalUnread = conversations.reduce((sum, conv) => {
-      return sum + (conv.user1Id === userId ? conv.unreadCount1 : conv.unreadCount2);
-    }, 0);
-    
-    res.json({
-      success: true,
-      data: { unreadCount: totalUnread }
-    });
-  } catch (error) {
-    console.error('Error fetching unread count:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Erreur lors du comptage des messages non lus'
     });
   }
 });
