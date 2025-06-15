@@ -28,7 +28,7 @@ model User {
   isVerified    Boolean  @default(false)
   emailVerified Boolean  @default(false)
   lastSeen      DateTime @default(now())
-  isOnline      Boolean  @default(false) // AJOUT pour le statut en ligne
+  isOnline      Boolean  @default(false)
 
   // Crédits et abonnement
   credits      Int       @default(10)
@@ -54,10 +54,6 @@ model User {
   photos           UserPhoto[]
   sentLikes        Like[]         @relation("SentLikes")
   receivedLikes    Like[]         @relation("ReceivedLikes")
-  sentMessages     Message[]      @relation("SentMessages")
-  receivedMessages Message[]      @relation("ReceivedMessages")
-  conversations1   Conversation[] @relation("User1Conversations")
-  conversations2   Conversation[] @relation("User2Conversations")
   blockedUsers     Block[]        @relation("BlockingUser")
   blockedByUsers   Block[]        @relation("BlockedUser")
   reports          Report[]       @relation("ReportingUser")
@@ -67,18 +63,24 @@ model User {
   notifications    Notification[]
   sessions         Session[]
 
-  // NOUVELLES RELATIONS pour les amis
+  // Relations pour la messagerie
+  conversationsAsUser1  Conversation[]       @relation("ConversationUser1")
+  conversationsAsUser2  Conversation[]       @relation("ConversationUser2")
+  sentMessages          Message[]            @relation("SentMessages")
+  receivedMessages      Message[]            @relation("ReceivedMessages")
+  messageReactions      MessageReaction[]
+
+  // Relations pour les amis
   friends                User[]          @relation("UserFriends")
   friendsOf              User[]          @relation("UserFriends")
   sentFriendRequests     FriendRequest[] @relation("SentFriendRequests")
   receivedFriendRequests FriendRequest[] @relation("ReceivedFriendRequests")
 
-  // NOUVELLES RELATIONS pour les messages vidéo
-  videoChatMessages VideoSessionMessage[]
-
-  // Relations pour VideoSession
-  videoSessionsAsUser1 VideoSession[] @relation("VideoSessionUser1")
-  videoSessionsAsUser2 VideoSession[] @relation("VideoSessionUser2")
+  // Relations pour les sessions vidéo
+  videoSessionsAsUser1  VideoSession[]       @relation("VideoSessionUser1")
+  videoSessionsAsUser2  VideoSession[]       @relation("VideoSessionUser2")
+  videoSessionMessages  VideoSessionMessage[]
+  videoSessionMetrics   VideoSessionMetric[]
 
   // Index pour les performances
   @@index([email])
@@ -87,16 +89,16 @@ model User {
   @@index([latitude, longitude])
   @@index([lastSeen])
   @@index([isActive, isVerified])
-  @@index([isOnline]) // AJOUT
+  @@index([isOnline])
 }
 
 model UserPhoto {
   id         Int      @id @default(autoincrement())
   userId     Int
   url        String
-  isProfile  Boolean  @default(false) // Photo de profil principale
-  isVerified Boolean  @default(false) // Vérifiée par modération
-  order      Int      @default(0) // Ordre d'affichage
+  isProfile  Boolean  @default(false)
+  isVerified Boolean  @default(false)
+  order      Int      @default(0)
   createdAt  DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -112,7 +114,7 @@ model Like {
   fromUserId  Int
   toUserId    Int
   isSuperLike Boolean  @default(false)
-  message     String? // Message optionnel avec le like
+  message     String?
   createdAt   DateTime @default(now())
 
   fromUser User @relation("SentLikes", fields: [fromUserId], references: [id], onDelete: Cascade)
@@ -122,7 +124,7 @@ model Like {
   @@index([toUserId])
 }
 
-// ========== NOUVEAU MODÈLE - DEMANDES D'AMIS ==========
+// ========== SYSTÈME D'AMIS ==========
 
 model FriendRequest {
   id          Int                 @id @default(autoincrement())
@@ -130,31 +132,37 @@ model FriendRequest {
   receiverId  Int
   status      FriendRequestStatus @default(PENDING)
   message     String?
-  createdAt   DateTime            @default(now())
   respondedAt DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
 
   sender   User @relation("SentFriendRequests", fields: [senderId], references: [id], onDelete: Cascade)
   receiver User @relation("ReceivedFriendRequests", fields: [receiverId], references: [id], onDelete: Cascade)
 
   @@unique([senderId, receiverId])
   @@index([receiverId, status])
+  @@index([status])
 }
 
-// ========== MESSAGERIE AMÉLIORÉE ==========
+// ========== MESSAGERIE COMPLÈTE ==========
 
 model Conversation {
-  id            Int       @id @default(autoincrement())
-  user1Id       Int
-  user2Id       Int
-  lastMessageAt DateTime?
-  lastMessage   String?
-  unreadCount1  Int       @default(0) // Messages non lus pour user1
-  unreadCount2  Int       @default(0) // Messages non lus pour user2
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id             Int       @id @default(autoincrement())
+  user1Id        Int
+  user2Id        Int
+  lastMessage    String?
+  lastMessageAt  DateTime?
+  unreadCount1   Int       @default(0)
+  unreadCount2   Int       @default(0)
+  isArchived1    Boolean   @default(false)
+  isArchived2    Boolean   @default(false)
+  isMuted1       Boolean   @default(false)
+  isMuted2       Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  user1    User      @relation("User1Conversations", fields: [user1Id], references: [id], onDelete: Cascade)
-  user2    User      @relation("User2Conversations", fields: [user2Id], references: [id], onDelete: Cascade)
+  user1    User      @relation("ConversationUser1", fields: [user1Id], references: [id])
+  user2    User      @relation("ConversationUser2", fields: [user2Id], references: [id])
   messages Message[]
 
   @@unique([user1Id, user2Id])
@@ -162,69 +170,103 @@ model Conversation {
 }
 
 model Message {
-  id             Int         @id @default(autoincrement())
+  id             Int               @id @default(autoincrement())
   conversationId Int
   senderId       Int
   receiverId     Int
-  content        String      @db.Text
-  messageType    MessageType @default(TEXT) // AJOUT pour différents types
-  attachments    Json? // AJOUT pour les pièces jointes
-  isRead         Boolean     @default(false)
+  content        String            @db.Text
+  messageType    MessageType       @default(TEXT)
+  attachments    Json?
+  isRead         Boolean           @default(false)
   readAt         DateTime?
-  isDeleted      Boolean     @default(false) // AJOUT pour soft delete
-  deletedAt      DateTime?
-  isEdited       Boolean     @default(false) // AJOUT
+  isEdited       Boolean           @default(false)
   editedAt       DateTime?
-  replyToId      Int? // AJOUT pour répondre aux messages
-  createdAt      DateTime    @default(now())
+  isDeleted      Boolean           @default(false)
+  deletedAt      DateTime?
+  replyToId      Int?
+  metadata       Json?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
 
-  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  sender       User         @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
-  receiver     User         @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
-  replyTo      Message?     @relation("MessageReplies", fields: [replyToId], references: [id])
-  replies      Message[]    @relation("MessageReplies")
+  conversation Conversation      @relation(fields: [conversationId], references: [id])
+  sender       User              @relation("SentMessages", fields: [senderId], references: [id])
+  receiver     User              @relation("ReceivedMessages", fields: [receiverId], references: [id])
+  replyTo      Message?          @relation("MessageReplies", fields: [replyToId], references: [id])
+  replies      Message[]         @relation("MessageReplies")
+  reactions    MessageReaction[]
 
   @@index([conversationId, createdAt])
-  @@index([receiverId, isRead])
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([isRead])
 }
 
-// ========== WEBCAM & VIDEO AMÉLIORÉE ==========
+model MessageReaction {
+  id         Int      @id @default(autoincrement())
+  messageId  Int
+  userId     Int
+  emoji      String
+  createdAt  DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@unique([messageId, userId, emoji])
+}
+
+// ========== SESSIONS VIDÉO ==========
 
 model VideoSession {
-  id                 String           @id @default(cuid())
-  roomId             String           @unique
-  user1Id            Int?
-  user2Id            Int?
-  sessionType        VideoSessionType @default(RANDOM)
-  startedAt          DateTime         @default(now())
-  endedAt            DateTime?
-  duration           Int? // durée en secondes
-  endReason          String?
-  identitiesRevealed Boolean          @default(false) // NOUVEAU CHAMP
-  createdAt          DateTime         @default(now())
-  updatedAt          DateTime         @updatedAt
+  id                Int                   @id @default(autoincrement())
+  roomId            String                @unique
+  user1Id           Int
+  user2Id           Int
+  sessionType       VideoSessionType      @default(RANDOM)
+  startedAt         DateTime              @default(now())
+  endedAt           DateTime?
+  duration          Int?
+  endReason         String?
+  friendshipCreated Boolean               @default(false)
+  createdAt         DateTime              @default(now())
 
-  user1    User?                 @relation("VideoSessionUser1", fields: [user1Id], references: [id])
-  user2    User?                 @relation("VideoSessionUser2", fields: [user2Id], references: [id])
+  user1    User                   @relation("VideoSessionUser1", fields: [user1Id], references: [id])
+  user2    User                   @relation("VideoSessionUser2", fields: [user2Id], references: [id])
   messages VideoSessionMessage[]
+  metrics  VideoSessionMetric[]
 
   @@index([user1Id])
   @@index([user2Id])
   @@index([startedAt])
 }
 
-// NOUVEAU MODÈLE - Messages de chat vidéo
 model VideoSessionMessage {
-  id             String   @id @default(uuid())
-  videoSessionId String
-  senderId       Int? // Nullable pour les utilisateurs anonymes
+  id             Int         @id @default(autoincrement())
+  videoSessionId Int
+  senderId       Int
   content        String
-  createdAt      DateTime @default(now())
+  messageType    MessageType @default(TEXT)
+  createdAt      DateTime    @default(now())
 
-  videoSession VideoSession @relation(fields: [videoSessionId], references: [id], onDelete: Cascade)
-  sender       User?        @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  videoSession VideoSession @relation(fields: [videoSessionId], references: [id])
+  sender       User         @relation(fields: [senderId], references: [id])
 
-  @@index([videoSessionId, createdAt])
+  @@index([videoSessionId])
+}
+
+model VideoSessionMetric {
+  id             Int          @id @default(autoincrement())
+  videoSessionId Int
+  userId         Int
+  metricType     String
+  value          Float
+  metadata       Json?
+  createdAt      DateTime     @default(now())
+
+  videoSession VideoSession @relation(fields: [videoSessionId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@index([videoSessionId])
+  @@index([userId])
 }
 
 // ========== SÉCURITÉ & MODÉRATION ==========
@@ -247,19 +289,20 @@ model Report {
   id          Int          @id @default(autoincrement())
   reporterId  Int
   reportedId  Int
-  reason      ReportReason
-  description String?      @db.Text
+  reason      String
+  details     String?      @db.Text
+  context     String?
+  metadata    Json?
   status      ReportStatus @default(PENDING)
   reviewedAt  DateTime?
-  reviewedBy  String? // Admin username
-  action      String? // Action prise
+  reviewedBy  Int?
   createdAt   DateTime     @default(now())
 
-  reporter User @relation("ReportingUser", fields: [reporterId], references: [id], onDelete: Cascade)
-  reported User @relation("ReportedUser", fields: [reportedId], references: [id], onDelete: Cascade)
+  reporter User @relation("ReportingUser", fields: [reporterId], references: [id])
+  reported User @relation("ReportedUser", fields: [reportedId], references: [id])
 
   @@index([status])
-  @@index([reportedId])
+  @@index([createdAt])
 }
 
 // ========== ANALYTICS & TRACKING ==========
@@ -283,7 +326,7 @@ model Notification {
   type      NotificationType
   title     String
   message   String
-  data      Json? // Données additionnelles (userId, matchId, etc.)
+  data      Json?
   isRead    Boolean          @default(false)
   readAt    DateTime?
   createdAt DateTime         @default(now())
@@ -321,15 +364,6 @@ enum Gender {
   OTHER
 }
 
-enum ReportReason {
-  INAPPROPRIATE_CONTENT
-  HARASSMENT
-  SPAM
-  FAKE_PROFILE
-  UNDERAGE
-  OTHER
-}
-
 enum ReportStatus {
   PENDING
   REVIEWED
@@ -338,16 +372,15 @@ enum ReportStatus {
 }
 
 enum NotificationType {
-  MATCH
   MESSAGE
+  FRIEND_REQUEST
+  MATCH
   LIKE
   SUPER_LIKE
   PROFILE_VIEW
-  FRIEND_REQUEST
   SYSTEM
 }
 
-// NOUVEAUX ENUMS
 enum FriendRequestStatus {
   PENDING
   ACCEPTED
@@ -361,11 +394,12 @@ enum MessageType {
   VIDEO
   AUDIO
   FILE
+  LOCATION
   SYSTEM
 }
 
 enum VideoSessionType {
   RANDOM
   FRIEND
-  MATCH
+  SCHEDULED
 }

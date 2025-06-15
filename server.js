@@ -19,6 +19,12 @@ const preferencesRoutes = require('./routes/preferences.routes');
 const exploreRoutes = require('./routes/exploreRoutes');
 const friendsRoutes = require('./routes/friends.routes');
 const messagesRoutes = require('./routes/messages.routes');
+const notificationsRoutes = require('./routes/notifications.routes');
+
+// Ajouter les handlers Socket.IO
+const { setupMessageHandlers } = require('./socketHandlers/messages');
+const { setupVideoChatHandlers } = require('./socketHandlers/videoChat');
+
 
 const app = express();
 const { prisma, setIo } = require('./config/shared');
@@ -30,6 +36,7 @@ if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
 }
 
+app.use('/api/notifications', notificationsRoutes);
 app.use('/uploads', cors(uploadsCorsOptions), express.static(uploadDir));
 app.use(helmet());
 app.use(cors({
@@ -45,6 +52,7 @@ app.use('/api/user', userRoutes);
 app.use('/api/user', photosRoutes);
 app.use('/api/friends', friendsRoutes);
 app.use('/api/messages', messagesRoutes);
+
 
 // Logger dev
 if (process.env.NODE_ENV === 'development') {
@@ -489,6 +497,11 @@ io.on('connection', (socket) => {
         canReveal: elapsedMinutes >= 0
       });
     }
+
+  // Ajouter les handlers de messagerie
+  setupMessageHandlers(io, socket);
+  setupVideoChatHandlers(io, socket, activeRooms);
+  
   });
 
   // === ÉVÉNEMENTS POUR LES DEMANDES D'AMIS EN SESSION VIDÉO ===
